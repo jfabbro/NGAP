@@ -36,18 +36,20 @@ export type CapPeriod = 'day' | 'month' | 'year' | 'episode' | 'session';
 export type ProtectedPair = 'mammary' | 'varices';
 
 export type ActFlags = {
-  article11BApplicable: boolean;   // false => the act escapes the 11B abatement (full rate)
-  protectedPair: ProtectedPair | null; // act belongs to a protected 2-act pair
-  cumulForbidden: boolean;         // cannot be cumulated with any other act of the session
-  mutuallyExclusive: boolean;      // among acts of the same family, only the highest is billable
-  nonCumulableWith: string[];      // ids of acts this one cannot be cumulated with
-  excludesMci: boolean;            // presence of this act forbids billing the MCI allowance
-  capMax: number | null;           // max billable occurrences over `capPeriod`
+  majNight: boolean;
+  majSundayHoliday: boolean;
+  majMip: boolean;
+  majMie: boolean;
+  majMci: boolean;
+  majMau: boolean;
+  article11BApplicable: boolean;
+  protectedPair: ProtectedPair | null;
+  mutuallyExclusive: boolean;
+  nonCumulableWith: string[];
+  capMax: number | null;
   capPeriod: CapPeriod | null;
-  absorbsTypes: ActType[];         // allowance/majoration types this forfait suppresses
-  excludesFirstOccurrence: boolean; // first occurrence is not billable (e.g. physician's)
-  prescriptionRequired: boolean;   // act needs a valid prescription to be billable
-  priorAgreementRequired: boolean; // "accord préalable" gating reimbursement
+  absorbsTypes: ActType[];
+  excludesFirstOccurrence: boolean;
 };
 
 export type Act = {
@@ -66,20 +68,11 @@ export type BillingHistory = {
   occurrences: Record<string, number>;
 };
 
-// Prescription covering the session, used for prescription derogations (category 5).
-export type Prescription = {
-  date: string;          // ISO date the prescription was written
-  untilHealing: boolean; // "jusqu'à cicatrisation" — covers dressings up to 3 months
-  coveredActIds: string[]; // act ids explicitly covered by the prescription
-};
-
 export type PatientContext = {
   dependent: boolean;
   childUnder5: boolean;
-  today?: string;            // ISO date of the session (defaults to now)
+  today?: string;
   history?: BillingHistory;
-  prescription?: Prescription;
-  priorAgreements?: string[]; // act ids for which prior agreement (AP) was granted
 };
 
 // Intermediate state flowing through the exception pipeline.
@@ -142,18 +135,20 @@ export type ExceptionFn = (propositions: Proposition[], ctx: PatientContext) => 
 const RANK_RATES = [1, 0.5, 0];
 
 const DEFAULT_FLAGS: ActFlags = {
+  majNight: true,
+  majSundayHoliday: true,
+  majMip: false,
+  majMie: false,
+  majMci: false,
+  majMau: false,
   article11BApplicable: true,
   protectedPair: null,
-  cumulForbidden: false,
   mutuallyExclusive: false,
   nonCumulableWith: [],
-  excludesMci: false,
   capMax: null,
   capPeriod: null,
   absorbsTypes: [],
   excludesFirstOccurrence: false,
-  prescriptionRequired: false,
-  priorAgreementRequired: false,
 };
 
 const flagsOf = (act: Act): ActFlags => ({ ...DEFAULT_FLAGS, ...act.flags });
@@ -201,20 +196,18 @@ const exceptionBSI: ExceptionFn = (propositions, ctx) => {
 
 // ── Category 3 — non-cumulable acts ──────────────────────────────────────────
 
-// (3c–3f) An act flagged `cumulForbidden`, or listing a present act in
-// `nonCumulableWith`, drops to rate 0. Each clinical pair is encoded through the
-// flags the acts carry in NGAP.json (e.g. self-catheterization education lists the
-// urethral catheterization id; the infusion-removal forfait lists the
-// continuous-surveillance forfait id).
+// (3c–3f) An act listing a present act in `nonCumulableWith` drops to rate 0.
+// Each clinical pair is encoded through the flags the acts carry in NGAP.json
+// (e.g. self-catheterization education lists the urethral catheterization id;
+// the infusion-removal forfait lists the continuous-surveillance forfait id).
 const exceptionNonCumulable: ExceptionFn = (propositions) => {
   const presentIds = new Set(propositions.map((p) => p.act.id));
-  const hasOthers = propositions.length > 1;
 
   return (
     propositions.map((p) => {
       const flags = flagsOf(p.act);
       const conflicts = flags.nonCumulableWith.some((id) => presentIds.has(id));
-      if (conflicts || (flags.cumulForbidden && hasOthers)) {
+      if (conflicts) {
         return ({ ...p, rate: 0 });
       }
       return (p);
@@ -247,11 +240,13 @@ const exceptionFamilyMutualExclusion: ExceptionFn = (propositions) => {
   );
 };
 
-// (3g) A wound first-care assessment (act flagged `excludesMci`) cannot be
-// associated with the MCI allowance — the MCI drops to 0 when both are present.
-const exceptionWoundAssessmentMci: ExceptionFn = (propositions) => {
-  const hasAssessment = propositions.some((p) => flagsOf(p.act).excludesMci);
-  if (!hasAssessment) {
+// MCI is only billable if every act in the session allows it (`majMci: true`).
+// E.g. bilan initial plaie has `majMci: false` → MCI drops to 0.
+const exceptionMciEligibility: ExceptionFn = (propositions) => {
+  const mciAllowed = propositions
+    .filter((p) => p.act.type !== ActType.MCI)
+    .every((p) => flagsOf(p.act).majMci);
+  if (mciAllowed) {
     return (propositions);
   }
   return (
@@ -295,45 +290,8 @@ const exceptionGlobalForfait: ExceptionFn = (propositions) => {
   );
 };
 
-// ── Category 7 — miscellaneous ───────────────────────────────────────────────
+// ── Category 4 — billing caps ──────────────────────────────────────────────────
 
-// (7b) An act flagged `excludesFirstOccurrence` is not billable on its very first
-// occurrence (e.g. the first intrathecal/peridural analgesic injection belongs to
-// the physician): rate 0 when the history shows no prior occurrence.
-const exceptionFirstOccurrenceExcluded: ExceptionFn = (propositions, ctx) => {
-  const occurrences = ctx.history?.occurrences ?? {};
-  return (
-    propositions.map((p) => {
-      if (flagsOf(p.act).excludesFirstOccurrence && (occurrences[p.act.id] ?? 0) === 0) {
-        return ({ ...p, rate: 0 });
-      }
-      return (p);
-    })
-  );
-};
-
-// (7c) An act flagged `priorAgreementRequired` is only reimbursed once the prior
-// agreement (AP) is granted: rate 0 while its id is absent from ctx.priorAgreements.
-const exceptionPriorAgreement: ExceptionFn = (propositions, ctx) => {
-  const granted = new Set(ctx.priorAgreements ?? []);
-  return (
-    propositions.map((p) => {
-      if (flagsOf(p.act).priorAgreementRequired && !granted.has(p.act.id)) {
-        return ({ ...p, rate: 0 });
-      }
-      return (p);
-    })
-  );
-};
-
-// ── Category 4 — billing caps (per day / month / year / episode / sessions) ──
-
-// An act flagged with `capMax` over a `capPeriod` is no longer billable once its
-// history already reaches the cap: it drops to rate 0. The period itself is
-// resolved upstream when building `ctx.history.occurrences` (which already counts
-// only the occurrences inside the relevant window). Each cap case (penile sheath
-// 1/24h, wound assessment 1/year, topical analgesia 8/episode, …) is data: set
-// `capMax` + `capPeriod` on the act in NGAP.json.
 const exceptionCaps: ExceptionFn = (propositions, ctx) => {
   const occurrences = ctx.history?.occurrences ?? {};
 
@@ -348,45 +306,15 @@ const exceptionCaps: ExceptionFn = (propositions, ctx) => {
   );
 };
 
-// ── Category 5 — prescription derogations ────────────────────────────────────
+// ── Category 7 — first occurrence ────────────────────────────────────────────
 
-const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
-
-// An act requiring a prescription is billable only if a valid one covers it.
-// Derogations loosen "covered": (5a) an "until healing" prescription covers any
-// dressing for up to 3 months; (5c) such a prescription also covers the wound
-// assessment; (5b) the intermediate BSI (DI type) needs no new prescription. An
-// act that requires a prescription but is covered by none drops to rate 0.
-const exceptionPrescription: ExceptionFn = (propositions, ctx) => {
-  const { prescription } = ctx;
-  const now = ctx.today ? new Date(ctx.today) : new Date();
-
-  const isUntilHealingValid = (): boolean => {
-    if (prescription === undefined || !prescription.untilHealing) {
-      return (false);
-    }
-    return (now.getTime() - new Date(prescription.date).getTime() <= 3 * MONTH_MS);
-  };
-
-  const isCovered = (act: Act): boolean => {
-    if (act.type === ActType.DI) {
-      return (true); // 5b — intermediate BSI tied to the last prescription
-    }
-    if (prescription === undefined) {
-      return (false);
-    }
-    if (prescription.coveredActIds.includes(act.id)) {
-      return (true);
-    }
-    // 5a / 5c — an "until healing" prescription covers dressings and the assessment.
-    const isDressingLike = act.family === 'PANSEMENT_COURANT'
-      || act.family === 'PANSEMENT_LOURD_COMPLEXE';
-    return (isDressingLike && isUntilHealingValid());
-  };
-
+// First intrathecal/peridural injection belongs to the physician: rate 0 when
+// history shows no prior occurrence of this act id.
+const exceptionFirstOccurrenceExcluded: ExceptionFn = (propositions, ctx) => {
+  const occurrences = ctx.history?.occurrences ?? {};
   return (
     propositions.map((p) => {
-      if (flagsOf(p.act).prescriptionRequired && !isCovered(p.act)) {
+      if (flagsOf(p.act).excludesFirstOccurrence && (occurrences[p.act.id] ?? 0) === 0) {
         return ({ ...p, rate: 0 });
       }
       return (p);
@@ -446,15 +374,12 @@ const cumulInjectionsInsideDependencyForfait: ExceptionFn = (propositions) => {
 // than to its own near-identical function:
 //   1a-1d  article11BApplicable: false             (venous puncture, home vaccination…)
 //   3a-3b  mutuallyExclusive + family              (article-10 surveillance)
-//   3c-3f  nonCumulableWith / cumulForbidden       (bladder education, infusion removal…)
-//   3g     excludesMci                             (wound assessment vs MCI)
-//   4a-4p  capMax + capPeriod + ctx.history        (penile sheath 1/24h, bilan 1/an…)
-//   5a-5c  prescriptionRequired + ctx.prescription (until-healing, intermediate BSI…)
-//   6a     BSA/BSB/BSC present                     (dependency forfait absorbs MAU)
-//   6b-6d  absorbsTypes                            (IPA / infusion / IC-BPCO forfaits)
-//   7a     article11BApplicable: false             (home vaccination)
-//   7b     excludesFirstOccurrence + ctx.history   (intrathecal/peridural injection)
-//   7c     priorAgreementRequired + ctx.priorAgreements (acts under prior agreement)
+//   3c-3f  nonCumulableWith                         (bladder education, infusion removal…)
+//   3g     majMci on each act                          (MCI eligibility)
+//   4a-4p  capMax + capPeriod + ctx.history            (penile sheath 1/24h, bilan 1/an…)
+//   6a     BSA/BSB/BSC present                         (dependency forfait absorbs MAU)
+//   6b-6d  absorbsTypes                                (IPA / infusion / IC-BPCO forfaits)
+//   7b     excludesFirstOccurrence + ctx.history       (intrathecal/peridural injection)
 
 // ─── Pipeline ─────────────────────────────────────────────────────────────────
 
@@ -472,15 +397,9 @@ const EXCEPTIONS: ExceptionFn[] = [
   // Category 3 — non-cumulable acts.
   exceptionNonCumulable,
   exceptionFamilyMutualExclusion,
-  exceptionWoundAssessmentMci,
-  // Category 7 — first-occurrence exclusion and prior-agreement gating.
+  exceptionMciEligibility,
   exceptionFirstOccurrenceExcluded,
-  exceptionPriorAgreement,
-  // Category 4 — billing caps (needs ctx.history).
   exceptionCaps,
-  // Category 5 — prescription derogations (needs ctx.prescription).
-  exceptionPrescription,
-  // Category 6 — global forfaits absorb allowances/majorations last.
   exceptionGlobalDependencyForfait,
   exceptionGlobalForfait,
 ];
